@@ -6,6 +6,7 @@ This file contains only the CEMN plug-in described in the manuscript:
 2. Clinical Evidence Memory Branch (CEMB) for local evidence selection,
    organization, and participant-specific reasoning.
 3. The shared sample-adaptive gate used for feature and prediction residuals.
+4. A parameter-free memory-level residual readout for case visualization.
 
 The global encoder is deliberately external.  Callers provide its participant-
 level feature and logits to :class:`ClinicalEvidenceMemoryNetwork.forward`.
@@ -432,12 +433,40 @@ class AdaptiveGatedResidualFusion(nn.Module):
         nn.init.zeros_(self.prediction_residual[1].weight)
         nn.init.zeros_(self.prediction_residual[1].bias)
 
+    def memory_level_readout(
+        self, memory_responses: Tensor
+    ) -> Dict[str, Tensor]:
+        """Compute memory-level residual readouts for case visualization.
+
+        The readout reuses the trained local projection and the linear
+        classifier of the residual prediction head. It introduces no
+        additional parameters or training objective.
+        """
+
+        memory_projected = self.local_projection(memory_responses)
+
+        # Case visualizations are generated with model.eval(). In evaluation
+        # mode, this linear layer is equivalent to the complete residual head
+        # because its preceding dropout layer is disabled.
+        memory_residual_logits = self.prediction_residual[1](memory_projected)
+        memory_probabilities = torch.softmax(memory_residual_logits, dim=-1)
+        memory_polarity = (
+            memory_probabilities[..., 1] - memory_probabilities[..., 0]
+        )
+
+        return {
+            "memory_residual_logits": memory_residual_logits,
+            "memory_probabilities": memory_probabilities,
+            "memory_polarity": memory_polarity,
+        }
+
     def forward(
         self,
         global_feature: Tensor,
         global_logits: Tensor,
         ra_feature: Tensor,
         clinical_feature: Tensor,
+        memory_responses: Tensor,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         if global_feature.ndim != 2 or global_feature.shape[-1] != self.global_dim:
             raise ValueError(
@@ -452,6 +481,15 @@ class AdaptiveGatedResidualFusion(nn.Module):
             raise ValueError(f"ra_feature must have shape {expected_local_shape}")
         if clinical_feature.shape != expected_local_shape:
             raise ValueError(f"clinical_feature must have shape {expected_local_shape}")
+        if (
+            memory_responses.ndim != 3
+            or memory_responses.shape[0] != global_feature.shape[0]
+            or memory_responses.shape[-1] != self.hidden_dim
+        ):
+            raise ValueError(
+                "memory_responses must have shape "
+                f"[batch, num_memory_slots, {self.hidden_dim}]"
+            )
 
         ra_strength = torch.sigmoid(self.ra_gate_logit)
         enhanced_global = global_feature + ra_strength * self.ra_projection(ra_feature)
@@ -465,6 +503,7 @@ class AdaptiveGatedResidualFusion(nn.Module):
         raw_prediction_residual = self.prediction_residual(fused_feature)
         prediction_residual = gate * raw_prediction_residual
         final_logits = global_logits + prediction_residual
+        memory_readout = self.memory_level_readout(memory_responses)
 
         auxiliary = {
             "ra_strength": ra_strength,
@@ -474,6 +513,7 @@ class AdaptiveGatedResidualFusion(nn.Module):
             "fused_feature": fused_feature,
             "raw_prediction_residual": raw_prediction_residual,
             "prediction_residual": prediction_residual,
+            **memory_readout,
         }
         return final_logits, auxiliary
 
@@ -535,7 +575,11 @@ class ClinicalEvidenceMemoryNetwork(nn.Module):
         ra_feature, ra_auxiliary = self.reasoning_anchor(modalities, valid_mask)
         clinical_feature, cemb_auxiliary = self.cemb(modalities, valid_mask)
         final_logits, fusion_auxiliary = self.fusion(
-            global_feature, global_logits, ra_feature, clinical_feature
+            global_feature,
+            global_logits,
+            ra_feature,
+            clinical_feature,
+            cemb_auxiliary["memory_responses"],
         )
 
         auxiliary = {
