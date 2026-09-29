@@ -24,7 +24,6 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 __all__ = [
     "CEMNConfig",
@@ -172,63 +171,13 @@ def _validate_turn_inputs(
     return batch_size, turns
 
 
-class _GraphAttentionHead(nn.Module):
-    """Dense additive graph-attention head used by the experimental RA."""
-
-    def __init__(self, input_dim: int, output_dim: int, dropout: float) -> None:
-        super().__init__()
-        self.dropout = float(dropout)
-        self.weight = nn.Parameter(torch.empty(input_dim, output_dim))
-        self.source_attention = nn.Parameter(torch.empty(output_dim, 1))
-        self.target_attention = nn.Parameter(torch.empty(output_dim, 1))
-        nn.init.xavier_uniform_(self.weight, gain=1.414)
-        nn.init.xavier_uniform_(self.source_attention, gain=1.414)
-        nn.init.xavier_uniform_(self.target_attention, gain=1.414)
-        self.activation = nn.LeakyReLU(0.01)
-
-    def forward(self, features: Tensor, adjacency: Tensor) -> Tuple[Tensor, Tensor]:
-        projected = torch.matmul(features, self.weight)
-        scores = self.activation(
-            projected @ self.source_attention
-            + (projected @ self.target_attention).transpose(1, 2)
-        )
-        attention = masked_softmax(scores, adjacency, dim=-1)
-        dropped_attention = F.dropout(attention, self.dropout, training=self.training)
-        output = torch.matmul(dropped_attention, projected)
-        return F.elu(output), attention
-
-
-class _MultiHeadGraphAttention(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float) -> None:
-        super().__init__()
-        if hidden_dim % num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by num_heads")
-        head_dim = hidden_dim // num_heads
-        self.dropout = float(dropout)
-        self.heads = nn.ModuleList(
-            [_GraphAttentionHead(hidden_dim, head_dim, dropout) for _ in range(num_heads)]
-        )
-
-    def forward(self, features: Tensor, adjacency: Tensor) -> Tuple[Tensor, Tensor]:
-        head_outputs = []
-        head_attentions = []
-        for head in self.heads:
-            output, attention = head(features, adjacency)
-            head_outputs.append(output)
-            head_attentions.append(attention)
-        output = torch.cat(head_outputs, dim=-1)
-        output = F.dropout(output, self.dropout, training=self.training)
-        return output, torch.stack(head_attentions, dim=1)
-
-
 class ReasoningAnchor(nn.Module):
     """Complementarily reread encoded turns with an independent RA path.
 
     The learnable anchor is warm-started for each sample by the masked mean of
-    its response-text turns.  In the experimental realization, the anchor and
-    modality nodes interact through stacked multi-head graph attention.  The
-    anchor is bidirectionally connected to every valid node; side-to-text edges
-    retain turn alignment and temporal edges connect adjacent response turns.
+    its response-text turns.  It then serves as the query of a stacked
+    multi-head attention path over the question, response-text, and available
+    behavioral-modality representations.
     """
 
     def __init__(
@@ -239,7 +188,6 @@ class ReasoningAnchor(nn.Module):
         num_layers: int = 2,
         num_heads: int = 8,
         dropout: float = 0.3,
-        side_gate_init: float = 0.0,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -247,52 +195,17 @@ class ReasoningAnchor(nn.Module):
         self.anchor = nn.Parameter(torch.empty(self.hidden_dim))
         nn.init.normal_(self.anchor, std=0.02)
 
-        self.side_projection = nn.ModuleDict(
-            {name: nn.Linear(self.hidden_dim, self.hidden_dim) for name in self.side_modalities}
-        )
-        self.side_scale = nn.ParameterDict(
-            {
-                name: nn.Parameter(torch.full((self.hidden_dim,), float(side_gate_init)))
-                for name in self.side_modalities
-            }
-        )
-        self.node_normalization = nn.LayerNorm(self.hidden_dim)
         self.attention_layers = nn.ModuleList(
             [
-                _MultiHeadGraphAttention(self.hidden_dim, num_heads, dropout)
+                nn.MultiheadAttention(
+                    self.hidden_dim, num_heads, dropout=float(dropout), batch_first=True
+                )
                 for _ in range(num_layers)
             ]
         )
-
-    def _adjacency(self, valid_mask: Tensor) -> Tensor:
-        batch_size, turns = valid_mask.shape
-        num_modality_blocks = 1 + len(self.side_modalities)
-        local_nodes = num_modality_blocks * turns
-        total_nodes = local_nodes + 1
-        anchor_index = local_nodes
-        device = valid_mask.device
-
-        adjacency = torch.zeros(total_nodes, total_nodes, dtype=torch.bool, device=device)
-        text_indices = torch.arange(turns, device=device)
-        if turns > 1:
-            adjacency[text_indices[:-1], text_indices[1:]] = True
-            adjacency[text_indices[1:], text_indices[:-1]] = True
-
-        for block_index in range(len(self.side_modalities)):
-            side_indices = torch.arange(turns, device=device) + (block_index + 1) * turns
-            adjacency[text_indices, side_indices] = True
-
-        adjacency[anchor_index, :] = True
-        adjacency[:, anchor_index] = True
-        adjacency.fill_diagonal_(True)
-        adjacency = adjacency.unsqueeze(0).expand(batch_size, -1, -1)
-
-        local_mask = torch.cat([valid_mask for _ in range(num_modality_blocks)], dim=1)
-        node_mask = torch.cat(
-            [local_mask, torch.ones(batch_size, 1, dtype=torch.bool, device=device)], dim=1
+        self.anchor_normalizations = nn.ModuleList(
+            [nn.LayerNorm(self.hidden_dim) for _ in range(num_layers)]
         )
-        adjacency = adjacency & node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
-        return adjacency | torch.eye(total_nodes, dtype=torch.bool, device=device).unsqueeze(0)
 
     def forward(
         self, modalities: Mapping[str, Tensor], valid_mask: Tensor
@@ -301,32 +214,37 @@ class ReasoningAnchor(nn.Module):
         batch_size, _ = _validate_turn_inputs(
             modalities, valid_mask, self.side_modalities, self.hidden_dim
         )
-        turn_mask = valid_mask.unsqueeze(-1).to(dtype=modalities["text"].dtype)
-
-        node_blocks = [modalities["text"] * turn_mask]
-        for name in self.side_modalities:
-            side = self.side_scale[name] * torch.tanh(
-                self.side_projection[name](modalities[name])
-            )
-            node_blocks.append(side * turn_mask)
-
-        anchor_seed = self.anchor.view(1, 1, -1) + masked_mean(
+        context = torch.cat(
+            [modalities["text"], *(modalities[name] for name in self.side_modalities)],
+            dim=1,
+        )
+        context_mask = torch.cat(
+            [valid_mask for _ in range(1 + len(self.side_modalities))], dim=1
+        )
+        anchor_state = self.anchor.view(1, 1, -1) + masked_mean(
             modalities["text"], valid_mask
         ).unsqueeze(1)
-        nodes = self.node_normalization(torch.cat([*node_blocks, anchor_seed], dim=1))
-        adjacency = self._adjacency(valid_mask)
 
         layer_attentions = []
-        for attention_layer in self.attention_layers:
-            update, attention = attention_layer(nodes, adjacency)
-            nodes = nodes + update
+        for attention_layer, normalization in zip(
+            self.attention_layers, self.anchor_normalizations
+        ):
+            update, attention = attention_layer(
+                anchor_state,
+                context,
+                context,
+                key_padding_mask=~context_mask,
+                need_weights=True,
+                average_attn_weights=False,
+            )
+            anchor_state = normalization(anchor_state + update)
             layer_attentions.append(attention)
 
-        anchor_feature = nodes[:, -1, :]
+        anchor_feature = anchor_state.squeeze(1)
         auxiliary = {
             "ra_attention": torch.stack(layer_attentions, dim=1),
             "ra_anchor_feature": anchor_feature,
-            "ra_adjacency": adjacency,
+            "ra_context_mask": context_mask,
         }
         if anchor_feature.shape != (batch_size, self.hidden_dim):
             raise RuntimeError("Unexpected Reasoning Anchor output shape")
@@ -406,22 +324,7 @@ class ClinicalEvidenceMemoryBranch(nn.Module):
         self.memory_normalization = nn.LayerNorm(self.hidden_dim)
 
         self.reason_score = nn.Linear(self.hidden_dim, 1)
-        self.severity_head = nn.Linear(self.hidden_dim, 1)
         self.patient_normalization = nn.LayerNorm(self.hidden_dim)
-
-    @staticmethod
-    def evidence_diversity_loss(evidence_attention: Tensor) -> Tensor:
-        """Penalize overlap among Evidence Query attention distributions."""
-
-        gram = torch.bmm(evidence_attention, evidence_attention.transpose(1, 2))
-        query_count = gram.shape[1]
-        diagonal = torch.eye(
-            query_count, device=gram.device, dtype=gram.dtype
-        ).unsqueeze(0) * gram
-        off_diagonal = gram - diagonal
-        return off_diagonal.square().sum((1, 2)).mean() / max(
-            1, query_count * (query_count - 1)
-        )
 
     @staticmethod
     def path_turn_importance(
@@ -470,7 +373,6 @@ class ClinicalEvidenceMemoryBranch(nn.Module):
             + torch.matmul(memory_attention, self.slot_value(evidence_slots))
         )
 
-        severity = self.severity_head(memory_responses).squeeze(-1)
         relevance_logits = self.reason_score(memory_responses).squeeze(-1)
         reason_attention = torch.softmax(relevance_logits, dim=-1)
         clinical_feature = self.patient_normalization(
@@ -487,7 +389,6 @@ class ClinicalEvidenceMemoryBranch(nn.Module):
             "memory_responses": memory_responses,
             "memory_attention": memory_attention,
             "memory_relevance_logits": relevance_logits,
-            "severity": severity,
             "reason_attention": reason_attention,
             "turn_importance": turn_importance,
         }
@@ -607,7 +508,6 @@ class ClinicalEvidenceMemoryNetwork(nn.Module):
             num_layers=config.ra_layers,
             num_heads=config.ra_heads,
             dropout=config.ra_dropout,
-            side_gate_init=config.side_gate_init,
         )
         self.cemb = ClinicalEvidenceMemoryBranch(
             config.hidden_dim,
